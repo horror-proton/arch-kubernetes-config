@@ -1,0 +1,71 @@
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # container:
+    #   image: ghcr.io/archlinux/archlinux:base-devel
+    steps:
+      - run: |
+          sudo -u $USER -H sh -c 'mkdir -p ~/.ssh && chmod 700 ~/.ssh'
+          sudo -u $USER -H sh -c 'ssh-keygen -t rsa -N "" -f ~/.ssh/id_rsa'
+
+          sudo tee /etc/ssh/ssh_config << EOF
+          Host *
+              StrictHostKeyChecking accept-new
+          EOF
+
+      - name: Update and install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install qemu-system-x86 sshpass
+          # pacman -Syu --noconfirm
+          # pacman -S --noconfirm git qemu-system-x86
+
+      - uses: actions/checkout@v4
+
+      - run: |
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+
+            stat /dev/kvm
+
+      - run: |
+          # TODO: use cloud init
+          wget --progress=bar:force https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-basic.qcow2
+
+          ln -sf Arch-Linux-x86_64-basic.qcow2 rootfs.qcow2
+
+          qemu-system-x86_64 -m 2G -enable-kvm -cpu host \
+            -nic "user,hostfwd=tcp::2222-:22" \
+            -drive file=rootfs.qcow2,if=virtio \
+            -vnc :0 \
+            -daemonize
+
+          nc -z localhost 2222
+
+          attempt=0
+          until ssh-keyscan -v -p 2222 localhost; do
+            echo "Waiting for SSH to be available..."
+            attempt=$((attempt + 1))
+            if [ $attempt -gt 12 ]; then
+              echo "Timeout waiting for SSH"
+              exit 1
+            fi
+            sleep 10
+          done
+
+          sshpass -p 'arch' ssh -vvv -p 2222 arch@localhost hostnamectl
+
+      - run: |
+          set -x
+          sshpass -p 'arch' ssh -p 2222 arch@localhost hostnamectl
+          sshpass -p 'arch' ssh-copy-id -p 2222 arch@localhost
+          
+
+      - run: |
+          ps aux
+          killall qemu-system-x86_64 || true
