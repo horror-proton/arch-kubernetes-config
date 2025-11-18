@@ -1,0 +1,189 @@
+on:
+  push:
+  pull_request:
+
+jobs:
+  cloud-init:
+    runs-on: ubuntu-latest
+    # container:
+    #   image: ghcr.io/archlinux/archlinux:base-devel
+    steps:
+      - run: |
+          sudo -u $USER -H sh -c 'mkdir -p ~/.ssh && chmod 700 ~/.ssh'
+          sudo -u $USER -H sh -c 'ssh-keygen -t rsa -N "" -f ~/.ssh/id_rsa'
+
+          sudo tee /etc/ssh/ssh_config << EOF
+          Host *
+              StrictHostKeyChecking accept-new
+          EOF
+
+      - name: Update and install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install qemu-system-x86 qemu-utils cloud-utils
+          # pacman -Syu --noconfirm
+          # pacman -S --noconfirm git qemu-system-x86
+
+      - uses: actions/checkout@v4
+
+      - name: Setup KVM
+        run: |
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+
+            stat /dev/kvm
+
+      - name: Prepare cloud-init seed
+        run: |
+          key=$(sudo -u $USER -H sh -c 'cat ~/.ssh/id_rsa.pub')
+          sed -i 's|SSH_PUBLIC_KEY|'"$key"'|g' ./cloud-init/kmaster-user-data.yml
+          cloud-localds -v --disk-format qcow2 seed.qcow2 ./cloud-init/kmaster-user-data.yml
+
+      - name: Arch Linux cloud image
+        run: |
+          wget --progress=bar:force https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2
+
+          qemu-img resize Arch-Linux-*.qcow2 +10G
+
+          ln -sf Arch-Linux-*.qcow2 rootfs.qcow2
+
+      - name: Boot
+        run: |
+          qemu-system-x86_64 -m 2G -enable-kvm -cpu host -smp 2 \
+            -nic "user,hostfwd=tcp::2222-:22" \
+            -drive file=rootfs.qcow2,if=virtio \
+            -drive file=seed.qcow2,if=virtio \
+            -vnc :0 \
+            -serial stdio &> serial.log &
+            # -daemonize
+
+          tail -f serial.log &
+
+          attempt=0
+          until ssh-keyscan -v -p 2222 127.0.0.1; do
+            attempt=$((attempt + 1))
+            if [ $attempt -gt 12 ]; then
+              echo "Timeout waiting for SSH"
+              exit 1
+            fi
+            echo "Waiting for SSH to be available..."
+            sleep 10
+          done
+
+          sudo tee /etc/ssh/ssh_config << EOF
+          Host kmaster-vm
+              HostName 127.0.0.1
+              Port 2222
+              User arch
+              StrictHostKeyChecking accept-new
+          EOF
+
+          attempt=0
+          until ssh kmaster-vm systemctl is-system-running; do
+            attempt=$((attempt + 1))
+            if [ $attempt -gt 12 ]; then
+              echo "Timeout waiting for systemd"
+              ssh kmaster-vm systemctl --failed
+              ssh kmaster-vm journalctl -b
+              exit 1
+            fi
+            echo "Waiting for systemd to be running..."
+            ssh kmaster-vm systemctl status
+            sleep 5
+          done
+
+          ssh kmaster-vm 'sudo usermod --password $(echo arch | openssl passwd -1 -stdin) arch'
+          sudo -u $USER -H sh -c 'cp ~/.ssh/id_rsa .'
+
+          killall tail || true
+
+      - name: Resize root filesystem
+        run: |
+          ssh kmaster-vm df -h
+          ssh kmaster-vm sudo pacman -Sy --noconfirm
+          ssh kmaster-vm sudo pacman -S --noconfirm parted
+          set -x
+          yes | ssh kmaster-vm sudo parted /dev/vda ---pretend-input-tty  resizepart 3 100% Yes
+          ssh kmaster-vm sudo btrfs filesystem resize max /
+          ssh kmaster-vm df -h
+
+      - name: Install CRI-O
+        run: |
+          yes | ssh kmaster-vm sudo pacman -S iptables-nft
+          ssh kmaster-vm sudo pacman -S --noconfirm cri-o
+
+          ssh kmaster-vm sudo tee /etc/crio/crio.conf.d/00-plugin-dir.conf << EOF
+          [crio.network]
+          plugin_dirs = [
+            "/opt/cni/bin/",
+            "/usr/lib/cni/",
+          ]
+          EOF
+          
+          ssh kmaster-vm sudo systemctl enable --now crio
+          ssh kmaster-vm sudo crio status info
+
+      - name: Config kubeadm
+        run: |
+          ssh kmaster-vm sudo pacman -S --noconfirm kubeadm kubernetes-control-plane kubectl cilium-cli
+          ssh kmaster-vm sudo systemctl enable --now kubelet.service
+          ssh kmaster-vm sudo kubeadm -v=5 init --cri-socket='unix:///run/crio/crio.sock' --pod-network-cidr=10.245.0.0/16
+
+          ssh kmaster-vm networkctl status --all
+  
+          ssh kmaster-vm systemctl status
+
+      - name: Install Cilium CNI
+        run: |
+          ssh kmaster-vm sudo env KUBECONFIG=/etc/kubernetes/admin.conf cilium-cli install
+          ssh kmaster-vm sudo env KUBECONFIG=/etc/kubernetes/admin.conf cilium-cli status --wait
+
+      - name: Set up kubeconfig
+        run: |
+          ssh kmaster-vm 'mkdir -p $HOME/.kube'
+          ssh kmaster-vm 'sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config'
+          ssh kmaster-vm 'sudo chown $USER:$USER $HOME/.kube/config'
+
+          ssh kmaster-vm << EOF
+          journalctl -f -u kubelet &
+
+          kubectl get nodes -o wide
+          kubectl wait --for=condition=Ready node/kmaster-vm
+          kubectl get nodes -o wide
+
+          kubectl get pods --all-namespaces -o wide
+          kubectl wait --for=condition=Ready --all pods --all-namespaces
+          kubectl get pods --all-namespaces -o wide
+
+          killall journalctl || true
+          EOF
+
+      - name: Print configuration
+        run: |
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          ssh kmaster-vm sudo kubeadm config print init-defaults | tee $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Shutdown control plane
+        run: |
+          ssh kmaster-vm kubectl cordon kmaster-vm
+          ssh kmaster-vm kubectl drain kmaster-vm --ignore-daemonsets --delete-emptydir-data
+          ssh kmaster-vm sudo systemctl stop kubelet
+          ssh kmaster-vm sudo systemctl stop crio
+          ssh kmaster-vm sudo poweroff
+
+          until ! nc -z 127.0.0.1 2222; do
+            echo "Waiting for VM to shut down..."
+            sleep 5
+          done
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: vm-ssh-private-key
+          path: id_rsa
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: vm-image
+          path: '*.qcow2'

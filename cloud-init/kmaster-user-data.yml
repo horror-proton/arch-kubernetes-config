@@ -1,0 +1,29 @@
+#cloud-config
+hostname: kmaster-vm
+users:
+  - name: arch
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: wheel
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - SSH_PUBLIC_KEY
+write_files:
+  - path: /etc/systemd/journald.conf.d/fw-ttys0.conf
+    permissions: '0644'
+    content: |
+      [Journal]
+      ForwardToTTY=yes
+      TTYPath=/dev/ttyS0
+      MaxLevelConsole=info
+runcmd:
+  - echo > /etc/fstab
+  - mount -a
+  - swapoff -a
+  - systemctl daemon-reload
+  - systemctl restart systemd-journald
+  - |
+    cat >> /etc/pacman.conf << EOF
+    [archlinuxcn]
+    Server = https://repo.archlinuxcn.org/\$arch
+    EOF
+  - pacman -Sy --noconfirm && pacman -S --noconfirm archlinuxcn-keyring
