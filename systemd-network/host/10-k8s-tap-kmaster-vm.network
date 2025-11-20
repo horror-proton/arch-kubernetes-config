@@ -1,0 +1,5 @@
+[Match]
+Name=tap-kmaster-vm
+
+[Network]
+Bridge=br-k8s

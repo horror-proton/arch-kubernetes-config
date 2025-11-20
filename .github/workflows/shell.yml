@@ -161,7 +161,9 @@ jobs:
 
       - name: Print configuration
         run: |
+          echo >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
+          echo >> $GITHUB_STEP_SUMMARY
           ssh kmaster-vm sudo kubeadm config print init-defaults | tee $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
@@ -187,3 +189,73 @@ jobs:
         with:
           name: vm-image
           path: '*.qcow2'
+
+  networking:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Config bridge manually
+        if: false # FIXME
+        run: |
+          sudo ip link add name br-k8s type bridge
+          sudo ip link set br-k8s up
+          sudo ip tuntap add tap-kmaster-vm mode tap user $USER
+          sudo ip tuntap add tap-kworker-vm mode tap user $USER
+          sudo ip link set tap-kmaster-vm master br-k8s
+          sudo ip link set tap-kworker-vm master br-k8s
+          sudo ip link set tap-kmaster-vm up
+          sudo ip link set tap-kworker-vm up
+
+          sudo ip addr add 192.168.100.1/24 dev br-k8s
+
+      - name: Config bridge with systemd-networkd
+        run: |
+          set -x
+          networkctl status --all
+          ip route
+
+          sudo cp -v systemd-network/host/* /etc/systemd/network/
+          journalctl -f &
+          sudo systemctl restart systemd-networkd
+
+          sleep 15
+          networkctl status --all
+          ip route
+
+          sudo ip link set dev tap-kmaster-vm up
+          sudo ip link set dev tap-kworker-vm up
+
+          killall journalctl || true
+
+      - run: |
+          stat /dev/net/tun
+
+          ip link show
+
+          networkctl status --all
+
+      # - uses: actions/download-artifact@v5
+
+      - run: |
+          sudo apt-get update
+          sudo apt-get -y install qemu-system-x86 qemu-utils cloud-utils
+
+      - name: Setup KVM
+        run: |
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+
+            stat /dev/kvm
+ 
+      - run: |
+          wget --progress=bar:force https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2
+
+          ln -sf Arch-Linux-*.qcow2 rootfs.qcow2
+
+          qemu-system-x86_64 -m 2G -enable-kvm -cpu host -smp 2 \
+            -drive file=rootfs.qcow2,if=virtio \
+            -nic tap,ifname=tap-kmaster-vm,script=no,downscript=no,vhost=off,model=virtio-net-pci \
+            -vnc :0 \
+            -serial stdio
