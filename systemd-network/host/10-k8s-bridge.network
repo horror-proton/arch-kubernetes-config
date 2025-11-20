@@ -1,0 +1,15 @@
+[Match]
+Name=br-k8s
+
+[Network]
+Address=192.168.100.1/24
+IPMasquerade=yes
+DHCPServer=yes
+
+[DHCPServerStaticLease]
+MACAddress=52:54:00:12:34:56
+Address=192.168.100.10
+
+[DHCPServerStaticLease]
+MACAddress=52:54:00:12:34:57
+Address=192.168.100.11

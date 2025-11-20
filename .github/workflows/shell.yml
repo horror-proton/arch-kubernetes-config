@@ -3,10 +3,30 @@ on:
   pull_request:
 
 jobs:
-  cloud-init:
+  meta:
     runs-on: ubuntu-latest
-    # container:
-    #   image: ghcr.io/archlinux/archlinux:base-devel
+    container:
+      image: ghcr.io/archlinux/archlinux:base-devel
+    outputs:
+      token: ${{ steps.kubeadm-token.outputs.token }}
+    steps:
+      - run: |
+          sudo pacman -Syu --noconfirm kubeadm
+      - id: kubeadm-token
+        run: |
+          echo token=$(kubeadm token generate) >> $GITHUB_OUTPUT
+
+  cloud-init:
+    needs: [meta]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: kmaster
+            mac: 52:54:00:12:34:56
+          - name: kworker
+            mac: 52:54:00:12:34:57
+      fail-fast: false
     steps:
       - run: |
           sudo -u $USER -H sh -c 'mkdir -p ~/.ssh && chmod 700 ~/.ssh'
@@ -20,11 +40,31 @@ jobs:
       - name: Update and install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get -y install qemu-system-x86 qemu-utils cloud-utils
+          sudo apt-get -y install qemu-system-x86 qemu-utils cloud-utils sshpass
           # pacman -Syu --noconfirm
           # pacman -S --noconfirm git qemu-system-x86
 
       - uses: actions/checkout@v4
+
+      - name: Config bridge with systemd-networkd
+        run: |
+          networkctl status --all
+          ip route
+
+          sudo cp -v systemd-network/host/* /etc/systemd/network/
+          journalctl -f &
+          sudo systemctl restart systemd-networkd
+
+          sleep 5
+
+          # a docker rule was blocking forwarding, allow it here
+          sudo iptables -I FORWARD -i br-k8s -o eth0 -j ACCEPT
+          sudo iptables -I FORWARD -i eth0 -o br-k8s -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+          networkctl status --all
+          ip route
+
+          killall journalctl || true
 
       - name: Setup KVM
         run: |
@@ -37,8 +77,8 @@ jobs:
       - name: Prepare cloud-init seed
         run: |
           key=$(sudo -u $USER -H sh -c 'cat ~/.ssh/id_rsa.pub')
-          sed -i 's|SSH_PUBLIC_KEY|'"$key"'|g' ./cloud-init/kmaster-user-data.yml
-          cloud-localds -v --disk-format qcow2 seed.qcow2 ./cloud-init/kmaster-user-data.yml
+          sed -i 's|SSH_PUBLIC_KEY|'"$key"'|g' ./cloud-init/${{ matrix.name }}-user-data.yml
+          cloud-localds -v --disk-format qcow2 seed.qcow2 ./cloud-init/${{ matrix.name }}-user-data.yml
 
       - name: Arch Linux cloud image
         run: |
@@ -50,8 +90,11 @@ jobs:
 
       - name: Boot
         run: |
+          export HOSTNAME=${{ matrix.name }}-vm
+          export MAC=${{ matrix.mac }}
+
           qemu-system-x86_64 -m 2G -enable-kvm -cpu host -smp 2 \
-            -nic "user,hostfwd=tcp::2222-:22" \
+            -nic tap,ifname=tap-${{ matrix.name }}-vm,script=no,downscript=no,vhost=off,model=virtio-net-pci,mac=$MAC \
             -drive file=rootfs.qcow2,if=virtio \
             -drive file=seed.qcow2,if=virtio \
             -vnc :0 \
@@ -60,60 +103,81 @@ jobs:
 
           tail -f serial.log &
 
+          echo ::group::Waiting for VM to boot
+          until ip neigh show | grep "$MAC REACHABLE"; do
+            ip neigh show
+            sleep 5
+          done
+          echo ::endgroup::
+
+          export IP=$(ip neigh show | grep "$MAC REACHABLE" | awk '{print $1}')
+
+          sudo tee -a /etc/hosts << EOF
+          $IP    $HOSTNAME
+          EOF
+
           attempt=0
-          until ssh-keyscan -v -p 2222 127.0.0.1; do
+          echo ::group::Waiting for SSH to be available ${attempt}
+          until nc -zv $HOSTNAME 22 && ssh-keyscan -v $HOSTNAME; do
+            echo ::endgroup::
             attempt=$((attempt + 1))
             if [ $attempt -gt 12 ]; then
               echo "Timeout waiting for SSH"
               exit 1
             fi
-            echo "Waiting for SSH to be available..."
+            echo ::group::Waiting for SSH to be available ${attempt}
             sleep 10
           done
+          echo ::endgroup::
 
           sudo tee /etc/ssh/ssh_config << EOF
-          Host kmaster-vm
-              HostName 127.0.0.1
-              Port 2222
+          Host $HOSTNAME
+              User arch
+              StrictHostKeyChecking accept-new
+          Host vm
+              Hostname $HOSTNAME
               User arch
               StrictHostKeyChecking accept-new
           EOF
 
           attempt=0
-          until ssh kmaster-vm systemctl is-system-running; do
+          echo ::group::Waiting for systemd to be running ${attempt}
+          until ssh vm systemctl is-system-running; do
+            echo ::endgroup::
             attempt=$((attempt + 1))
             if [ $attempt -gt 12 ]; then
-              echo "Timeout waiting for systemd"
-              ssh kmaster-vm systemctl --failed
-              ssh kmaster-vm journalctl -b
+              ssh vm systemctl list-jobs
+              ssh vm systemctl --failed
+              ssh vm journalctl -b
               exit 1
             fi
-            echo "Waiting for systemd to be running..."
-            ssh kmaster-vm systemctl status
+            ssh vm systemctl list-jobs
+
+            echo ::group::Waiting for systemd to be running ${attempt}
             sleep 5
           done
+          echo ::endgroup::
 
-          ssh kmaster-vm 'sudo usermod --password $(echo arch | openssl passwd -1 -stdin) arch'
+          ssh vm 'sudo usermod --password $(echo arch | openssl passwd -1 -stdin) arch'
           sudo -u $USER -H sh -c 'cp ~/.ssh/id_rsa .'
 
           killall tail || true
 
       - name: Resize root filesystem
         run: |
-          ssh kmaster-vm df -h
-          ssh kmaster-vm sudo pacman -Sy --noconfirm
-          ssh kmaster-vm sudo pacman -S --noconfirm parted
-          set -x
-          yes | ssh kmaster-vm sudo parted /dev/vda ---pretend-input-tty  resizepart 3 100% Yes
-          ssh kmaster-vm sudo btrfs filesystem resize max /
-          ssh kmaster-vm df -h
+          ssh vm df -h
+          ssh vm sudo pacman -Sy --noconfirm
+          ssh vm sudo pacman -S --noconfirm parted
+          yes | ssh vm sudo parted /dev/vda ---pretend-input-tty  resizepart 3 100% Yes
+          ssh vm sudo btrfs filesystem resize max /
+          ssh vm df -h
 
       - name: Install CRI-O
         run: |
-          yes | ssh kmaster-vm sudo pacman -S iptables-nft
-          ssh kmaster-vm sudo pacman -S --noconfirm cri-o
+          yes | ssh vm sudo pacman -S iptables-nft
+          ssh vm sudo pacman -S --noconfirm cri-o
 
-          ssh kmaster-vm sudo tee /etc/crio/crio.conf.d/00-plugin-dir.conf << EOF
+          ssh vm sudo tee /etc/crio/crio.conf.d/00-plugin-dir.conf << EOF
           [crio.network]
           plugin_dirs = [
             "/opt/cni/bin/",
@@ -121,25 +185,55 @@ jobs:
           ]
           EOF
           
-          ssh kmaster-vm sudo systemctl enable --now crio
-          ssh kmaster-vm sudo crio status info
+          ssh vm sudo systemctl enable --now crio
+          ssh vm sudo crio status info
 
-      - name: Config kubeadm
+      - name: Config kubeadm init
+        if: matrix.name == 'kmaster'
         run: |
-          ssh kmaster-vm sudo pacman -S --noconfirm kubeadm kubernetes-control-plane kubectl cilium-cli
-          ssh kmaster-vm sudo systemctl enable --now kubelet.service
-          ssh kmaster-vm sudo kubeadm -v=5 init --cri-socket='unix:///run/crio/crio.sock' --pod-network-cidr=10.245.0.0/16
+          ssh vm sudo pacman -S --noconfirm kubernetes-tools kubernetes-control-plane cilium-cli
+          ssh vm sudo systemctl enable --now kubelet.service
+          ssh vm sudo kubeadm -v=5 init \
+            --cri-socket='unix:///run/crio/crio.sock' \
+            --pod-network-cidr=10.245.0.0/16 \
+            --token=${{ needs.meta.outputs.token }}
 
-          ssh kmaster-vm networkctl status --all
-  
-          ssh kmaster-vm systemctl status
+      - name: Config kubeadm join
+        if: matrix.name != 'kmaster'
+        run: |
+          ssh vm sudo pacman -S --noconfirm kubernetes-tools kubernetes-node cilium-cli
+          ssh vm sudo systemctl enable --now kubelet.service
+
+          ssh vm sudo kubeadm config images pull
+
+          ssh vm sudo tee /etc/systemd/system/kubeadm-join.service << EOF
+          [Unit]
+          Description=Kubeadm Join Service
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/kubeadm -v=5 join kmaster-vm:6443 \
+            --cri-socket='unix:///run/crio/crio.sock' \
+            --token=${{ needs.meta.outputs.token }} \
+            --discovery-token-unsafe-skip-ca-verification
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          ssh vm sudo systemctl daemon-reload
+          ssh vm sudo systemctl enable kubeadm-join.service
 
       - name: Install Cilium CNI
+        if: matrix.name == 'kmaster'
         run: |
-          ssh kmaster-vm sudo env KUBECONFIG=/etc/kubernetes/admin.conf cilium-cli install
-          ssh kmaster-vm sudo env KUBECONFIG=/etc/kubernetes/admin.conf cilium-cli status --wait
+          ssh vm sudo env KUBECONFIG=/etc/kubernetes/admin.conf cilium-cli install
+          ssh vm sudo env KUBECONFIG=/etc/kubernetes/admin.conf cilium-cli status --wait
 
       - name: Set up kubeconfig
+        if: matrix.name == 'kmaster'
         run: |
           ssh kmaster-vm 'mkdir -p $HOME/.kube'
           ssh kmaster-vm 'sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config'
@@ -160,30 +254,63 @@ jobs:
           EOF
 
       - name: Print configuration
+        if: matrix.name == 'kmaster'
         run: |
+          echo 'kubeadm config:' >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          ssh kmaster-vm sudo kubeadm config print init-defaults | tee $GITHUB_STEP_SUMMARY
+          ssh vm sudo kubeadm config print init-defaults | tee -a $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Shutdown control plane
+        if: matrix.name == 'kmaster'
         run: |
-          ssh kmaster-vm kubectl cordon kmaster-vm
-          ssh kmaster-vm kubectl drain kmaster-vm --ignore-daemonsets --delete-emptydir-data
-          ssh kmaster-vm sudo systemctl stop kubelet
-          ssh kmaster-vm sudo systemctl stop crio
-          ssh kmaster-vm sudo poweroff
+          ssh vm kubectl cordon kmaster-vm
+          ssh vm kubectl drain kmaster-vm --ignore-daemonsets --delete-emptydir-data
 
-          until ! nc -z 127.0.0.1 2222; do
-            echo "Waiting for VM to shut down..."
-            sleep 5
-          done
+          ssh vm journalctl -f &
+
+          ssh vm sudo mount -t tmpfs tmpfs /etc/kubernetes/manifests
+          sleep 10
+          ssh vm sudo systemctl stop kubelet
+
+          set +e
+
+          ssh vm sudo bash -x 'crictl pods'
+          ssh vm sudo bash -x 'crictl pods -q | xargs -r crictl stopp'
+          sleep 10
+          ssh vm sudo systemctl stop crio
+
+      - name: Poweroff
+        run: |
+          ssh vm sudo systemctl status
+
+          ssh vm sudo systemctl poweroff || true
+
+          tail -f serial.log &
+          tail --pid=$(pidof qemu-system-x86_64) -f /dev/null
+          killall tail || true
+
+      - name: Dump VM journal
+        if: always()
+        run: |
+          killall qemu-system-x86_64 || true
+          sudo modprobe nbd
+          sudo qemu-nbd --read-only --connect=/dev/nbd0 rootfs.qcow2
+          sudo fdisk -l /dev/nbd0
+          sudo mount -oro /dev/nbd0p3 /mnt
+          sudo ls -l /mnt/var/log/journal
+
+          echo ::group::
+          sudo journalctl --directory=/mnt/var/log/journal | tee vm-journal.log
+          echo ::endgroup::
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: ${{ matrix.name }}-vm-image
+          path: 'rootfs.qcow2'
 
       - uses: actions/upload-artifact@v5
         with:
-          name: vm-ssh-private-key
+          name: ${{ matrix.name }}-vm-ssh-private-key
           path: id_rsa
-
-      - uses: actions/upload-artifact@v5
-        with:
-          name: vm-image
-          path: '*.qcow2'

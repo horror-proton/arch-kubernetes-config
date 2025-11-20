@@ -1,5 +1,5 @@
 #cloud-config
-hostname: kmaster-vm
+hostname: kworker-vm
 users:
   - name: arch
     sudo: ALL=(ALL) NOPASSWD:ALL
