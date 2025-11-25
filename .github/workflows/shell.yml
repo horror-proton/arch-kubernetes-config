@@ -206,6 +206,8 @@ jobs:
           Description=Kubeadm Join Service
           After=network-online.target
           Wants=network-online.target
+          Requires=kubelet.service
+          Requires=crio.service
 
           [Service]
           Type=oneshot
@@ -429,6 +431,7 @@ jobs:
           grep -e '-vm' /etc/hosts | ssh kmaster-vm sudo tee -a /etc/hosts
 
           ssh $HOSTNAME journalctl -u kubeadm-join.service
+          ssh $HOSTNAME journalctl -u crio.service
 
           kill $(jobs -p) || true
 
