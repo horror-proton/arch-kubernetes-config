@@ -28,15 +28,6 @@ jobs:
             mac: 52:54:00:12:34:57
       fail-fast: false
     steps:
-      - run: |
-          sudo -u $USER -H sh -c 'mkdir -p ~/.ssh && chmod 700 ~/.ssh'
-          sudo -u $USER -H sh -c 'ssh-keygen -t rsa -N "" -f ~/.ssh/id_rsa'
-
-          sudo tee /etc/ssh/ssh_config << EOF
-          Host *
-              StrictHostKeyChecking accept-new
-          EOF
-
       - name: Update and install dependencies
         run: |
           sudo apt-get update
@@ -46,10 +37,15 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - name: Config bridge with systemd-networkd
+      - name: Config ssh and networking
         run: |
-          networkctl status --all
-          ip route
+          sudo -u $USER -H sh -c 'mkdir -p ~/.ssh && chmod 700 ~/.ssh'
+          sudo -u $USER -H sh -c 'ssh-keygen -t rsa -N "" -f ~/.ssh/id_rsa'
+
+          sudo tee /etc/ssh/ssh_config << EOF
+          Host *
+              StrictHostKeyChecking accept-new
+          EOF
 
           sudo cp -v systemd-network/host/* /etc/systemd/network/
           journalctl -f &
@@ -93,15 +89,17 @@ jobs:
           export HOSTNAME=${{ matrix.name }}-vm
           export MAC=${{ matrix.mac }}
 
+          # --slice=machine.slice
+
+          systemd-run --user -d --unit=$HOSTNAME \
           qemu-system-x86_64 -m 2G -enable-kvm -cpu host -smp 2 \
             -nic tap,ifname=tap-${{ matrix.name }}-vm,script=no,downscript=no,vhost=off,model=virtio-net-pci,mac=$MAC \
             -drive file=rootfs.qcow2,if=virtio \
             -drive file=seed.qcow2,if=virtio \
             -vnc :0 \
-            -serial stdio &> serial.log &
-            # -daemonize
+            -serial stdio
 
-          tail -f serial.log &
+          journalctl --user -f -u $HOSTNAME &
 
           echo ::group::Waiting for VM to boot
           until ip neigh show | grep "$MAC REACHABLE"; do
@@ -111,10 +109,7 @@ jobs:
           echo ::endgroup::
 
           export IP=$(ip neigh show | grep "$MAC REACHABLE" | awk '{print $1}')
-
-          sudo tee -a /etc/hosts << EOF
-          $IP    $HOSTNAME
-          EOF
+          echo $IP $HOSTNAME | sudo tee -a /etc/hosts
 
           attempt=0
           echo ::group::Waiting for SSH to be available ${attempt}
@@ -130,7 +125,7 @@ jobs:
           done
           echo ::endgroup::
 
-          sudo tee /etc/ssh/ssh_config << EOF
+          sudo tee -a /etc/ssh/ssh_config << EOF
           Host $HOSTNAME
               User arch
               StrictHostKeyChecking accept-new
@@ -161,7 +156,7 @@ jobs:
           ssh vm 'sudo usermod --password $(echo arch | openssl passwd -1 -stdin) arch'
           sudo -u $USER -H sh -c 'cp ~/.ssh/id_rsa .'
 
-          killall tail || true
+          kill $(jobs -p) || true
 
       - name: Resize root filesystem
         run: |
@@ -286,9 +281,9 @@ jobs:
 
           ssh vm sudo systemctl poweroff || true
 
-          tail -f serial.log &
+          journalctl --user -f -u $HOSTNAME &
           tail --pid=$(pidof qemu-system-x86_64) -f /dev/null
-          killall tail || true
+          kill $(jobs -p) || true
 
       - name: Dump VM journal
         if: always()
@@ -314,3 +309,139 @@ jobs:
         with:
           name: ${{ matrix.name }}-vm-ssh-private-key
           path: id_rsa
+
+  run-cluster:
+    needs: [meta, cloud-init]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update and install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install qemu-system-x86 qemu-utils cloud-utils sshpass
+          # pacman -Syu --noconfirm
+          # pacman -S --noconfirm git qemu-system-x86
+
+      - uses: actions/checkout@v4
+
+      - name: Config ssh and networking
+        run: |
+          sudo -u $USER -H sh -c 'mkdir -p ~/.ssh && chmod 700 ~/.ssh'
+          sudo -u $USER -H sh -c 'ssh-keygen -t rsa -N "" -f ~/.ssh/id_rsa'
+
+          sudo tee -a /etc/ssh/ssh_config << EOF
+          Host *
+              StrictHostKeyChecking accept-new
+          EOF
+
+          sudo cp -v systemd-network/host/* /etc/systemd/network/
+          journalctl -f &
+          sudo systemctl restart systemd-networkd
+
+          sleep 5
+
+          # a docker rule was blocking forwarding, allow it here
+          sudo iptables -I FORWARD -i br-k8s -o eth0 -j ACCEPT
+          sudo iptables -I FORWARD -i eth0 -o br-k8s -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+          networkctl status --all
+          ip route
+
+          killall journalctl || true
+
+      - name: Setup KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+          stat /dev/kvm
+
+      - uses: actions/download-artifact@v6
+
+      - name: Boot kmaster VM
+        run: |
+          export HOSTNAME=kmaster-vm
+          export MAC=52:54:00:12:34:56
+
+          systemd-run --user -d --unit=$HOSTNAME \
+          qemu-system-x86_64 -m 2G -enable-kvm -cpu host -smp 2 \
+            -nic tap,ifname=tap-$HOSTNAME,script=no,downscript=no,vhost=off,model=virtio-net-pci,mac=$MAC \
+            -drive file=$HOSTNAME-image/rootfs.qcow2,if=virtio \
+            -vnc :0 \
+            -serial stdio
+
+          journalctl --user -f -u $HOSTNAME &
+
+          until ip neigh show | grep "$MAC REACHABLE"; do sleep 5; done
+
+          export IP=$(ip neigh show | grep "$MAC REACHABLE" | awk '{print $1}')
+          echo $IP $HOSTNAME | sudo tee -a /etc/hosts
+
+          until ssh-keyscan -v $HOSTNAME; do sleep 5; done
+
+          sudo tee -a /etc/ssh/ssh_config << EOF
+          Host $HOSTNAME
+              User arch
+              StrictHostKeyChecking accept-new
+          EOF
+
+          sshpass -p 'arch' ssh-copy-id -o StrictHostKeyChecking=accept-new $HOSTNAME
+
+          ssh $HOSTNAME journalctl -f &
+
+          ssh $HOSTNAME bash -e <<EOF
+          until kubectl wait --for=condition=Ready node/kmaster-vm --timeout=5s;
+          do true; done
+          EOF
+
+          kill $(jobs -p) || true
+
+      - name: Boot kworker VM
+        run: |
+          export HOSTNAME=kworker-vm
+          export MAC=52:54:00:12:34:57
+
+          systemd-run --user -d --unit=$HOSTNAME \
+          qemu-system-x86_64 -m 2G -enable-kvm -cpu host -smp 2 \
+            -nic tap,ifname=tap-$HOSTNAME,script=no,downscript=no,vhost=off,model=virtio-net-pci,mac=$MAC \
+            -drive file=$HOSTNAME-image/rootfs.qcow2,if=virtio \
+            -vnc :1 \
+            -serial stdio
+
+          journalctl --user -f -u $HOSTNAME &
+
+          until ip neigh show | grep "$MAC REACHABLE"; do sleep 5; done
+
+          export IP=$(ip neigh show | grep "$MAC REACHABLE" | awk '{print $1}')
+          echo $IP $HOSTNAME | sudo tee -a /etc/hosts
+
+          until ssh-keyscan -v $HOSTNAME; do sleep 5; done
+
+          sudo tee -a /etc/ssh/ssh_config << EOF
+          Host $HOSTNAME
+              User arch
+              StrictHostKeyChecking accept-new
+          EOF
+
+          sshpass -p 'arch' ssh-copy-id -o StrictHostKeyChecking=accept-new $HOSTNAME
+
+          grep -e '-vm' /etc/hosts | ssh $HOSTNAME sudo tee -a /etc/hosts
+          grep -e '-vm' /etc/hosts | ssh kmaster-vm sudo tee -a /etc/hosts
+
+          ssh $HOSTNAME journalctl -u kubeadm-join.service
+
+          kill $(jobs -p) || true
+
+      - name: Verify cluster
+        run: |
+          ssh kmaster-vm << EOF
+
+          kubectl get nodes -o wide
+          kubectl wait --for=condition=Ready node/kworker-vm
+          kubectl get nodes -o wide
+
+          kubectl get pods --all-namespaces -o wide
+          kubectl wait --for=condition=Ready --all pods --all-namespaces
+          kubectl get pods --all-namespaces -o wide
+
+          EOF
