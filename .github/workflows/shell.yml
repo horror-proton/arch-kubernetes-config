@@ -47,7 +47,7 @@ jobs:
               StrictHostKeyChecking accept-new
           EOF
 
-          sudo cp -v systemd-network/host/* /etc/systemd/network/
+          sudo cp -vr systemd-network/host/* /etc/systemd/network/
           journalctl -f &
           sudo systemctl restart systemd-networkd
 
@@ -333,7 +333,7 @@ jobs:
               StrictHostKeyChecking accept-new
           EOF
 
-          sudo cp -v systemd-network/host/* /etc/systemd/network/
+          sudo cp -vr systemd-network/host/* /etc/systemd/network/
           journalctl -f &
           sudo systemctl restart systemd-networkd
 
