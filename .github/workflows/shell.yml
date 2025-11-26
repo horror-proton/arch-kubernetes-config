@@ -93,37 +93,26 @@ jobs:
 
           systemd-run --user -d --unit=$HOSTNAME \
           qemu-system-x86_64 -m 2G -enable-kvm -cpu host -smp 2 \
-            -nic tap,ifname=tap-${{ matrix.name }}-vm,script=no,downscript=no,vhost=off,model=virtio-net-pci,mac=$MAC \
+            -nic tap,ifname=tap-$HOSTNAME,script=no,downscript=no,vhost=off,model=virtio-net-pci,mac=$MAC \
             -drive file=rootfs.qcow2,if=virtio \
             -drive file=seed.qcow2,if=virtio \
-            -vnc :0 \
+            -display none \
             -serial stdio
 
           journalctl --user -f -u $HOSTNAME &
 
           echo ::group::Waiting for VM to boot
-          until ip neigh show | grep "$MAC REACHABLE"; do
-            ip neigh show
-            sleep 5
-          done
+          timeout -v 5m bash -c "until ip neigh show | tee /dev/stderr | grep $MAC\ REACHABLE; do sleep 2; done"
           echo ::endgroup::
 
           export IP=$(ip neigh show | grep "$MAC REACHABLE" | awk '{print $1}')
           echo $IP $HOSTNAME | sudo tee -a /etc/hosts
 
-          attempt=0
-          echo ::group::Waiting for SSH to be available ${attempt}
-          until nc -zv $HOSTNAME 22 && ssh-keyscan -v $HOSTNAME; do
-            echo ::endgroup::
-            attempt=$((attempt + 1))
-            if [ $attempt -gt 12 ]; then
-              echo "Timeout waiting for SSH"
-              exit 1
-            fi
-            echo ::group::Waiting for SSH to be available ${attempt}
-            sleep 10
-          done
+          echo ::group::Waiting for SSH to be available
+          timeout -v 5m bash -c "until nc -zv $HOSTNAME 22; do sleep 2; done"
           echo ::endgroup::
+
+          ssh-keyscan -v $HOSTNAME
 
           sudo tee -a /etc/ssh/ssh_config << EOF
           Host $HOSTNAME
@@ -135,22 +124,16 @@ jobs:
               StrictHostKeyChecking accept-new
           EOF
 
-          attempt=0
-          echo ::group::Waiting for systemd to be running ${attempt}
-          until ssh vm systemctl is-system-running; do
-            echo ::endgroup::
-            attempt=$((attempt + 1))
-            if [ $attempt -gt 12 ]; then
-              ssh vm systemctl list-jobs
-              ssh vm systemctl --failed
-              ssh vm journalctl -b
-              exit 1
-            fi
-            ssh vm systemctl list-jobs
+          ssh vm true
 
-            echo ::group::Waiting for systemd to be running ${attempt}
+          echo ::group::Waiting for systemd to be running
+          timeout -v 5m ssh vm bash -e << EOF
+          until systemctl is-system-running; do
+            systemctl list-jobs
+            systemctl --failed
             sleep 5
           done
+          EOF
           echo ::endgroup::
 
           ssh vm 'sudo usermod --password $(echo arch | openssl passwd -1 -stdin) arch'
@@ -172,14 +155,6 @@ jobs:
           yes | ssh vm sudo pacman -S iptables-nft
           ssh vm sudo pacman -S --noconfirm cri-o
 
-          ssh vm sudo tee /etc/crio/crio.conf.d/00-plugin-dir.conf << EOF
-          [crio.network]
-          plugin_dirs = [
-            "/opt/cni/bin/",
-            "/usr/lib/cni/",
-          ]
-          EOF
-          
           ssh vm sudo systemctl enable --now crio
           ssh vm sudo crio status info
 
@@ -206,15 +181,16 @@ jobs:
           Description=Kubeadm Join Service
           After=network-online.target
           Wants=network-online.target
-          Requires=kubelet.service
+          After=kubelet.service
           Requires=crio.service
 
           [Service]
           Type=oneshot
-          ExecStart=/usr/bin/kubeadm -v=5 join kmaster-vm:6443 \
+          ExecStart=/usr/bin/kubeadm -v=6 join kmaster-vm:6443 \
             --cri-socket='unix:///run/crio/crio.sock' \
             --token=${{ needs.meta.outputs.token }} \
             --discovery-token-unsafe-skip-ca-verification
+          Restart=on-failure
 
           [Install]
           WantedBy=multi-user.target
@@ -369,7 +345,7 @@ jobs:
           qemu-system-x86_64 -m 2G -enable-kvm -cpu host -smp 2 \
             -nic tap,ifname=tap-$HOSTNAME,script=no,downscript=no,vhost=off,model=virtio-net-pci,mac=$MAC \
             -drive file=$HOSTNAME-image/rootfs.qcow2,if=virtio \
-            -vnc :0 \
+            -display none \
             -serial stdio
 
           journalctl --user -f -u $HOSTNAME &
@@ -407,7 +383,7 @@ jobs:
           qemu-system-x86_64 -m 2G -enable-kvm -cpu host -smp 2 \
             -nic tap,ifname=tap-$HOSTNAME,script=no,downscript=no,vhost=off,model=virtio-net-pci,mac=$MAC \
             -drive file=$HOSTNAME-image/rootfs.qcow2,if=virtio \
-            -vnc :1 \
+            -display none \
             -serial stdio
 
           journalctl --user -f -u $HOSTNAME &
@@ -430,21 +406,36 @@ jobs:
           grep -e '-vm' /etc/hosts | ssh $HOSTNAME sudo tee -a /etc/hosts
           grep -e '-vm' /etc/hosts | ssh kmaster-vm sudo tee -a /etc/hosts
 
-          ssh $HOSTNAME journalctl -u kubeadm-join.service
-          ssh $HOSTNAME journalctl -u crio.service
+          ssh $HOSTNAME journalctl -f &
+
+          timeout -v 5m ssh $HOSTNAME bash -e << EOF
+          until systemctl is-system-running; do
+            systemctl list-jobs
+            systemctl --failed
+            sleep 5
+          done
+          EOF
 
           kill $(jobs -p) || true
 
+      - if: ${{ failure() }}
+        run: |
+          ssh kworker-vm journalctl -u kubeadm-join.service
+          ssh kworker-vm journalctl -u kubelet.service
+          ssh kworker-vm journalctl -u crio.service
+
       - name: Verify cluster
         run: |
-          ssh kmaster-vm << EOF
+          timeout -v 5m ssh kmaster-vm bash -e << EOF
+
+          until kubectl wait --for=condition=Ready node/kworker-vm; do kubectl get nodes -o wide; done
 
           kubectl get nodes -o wide
-          kubectl wait --for=condition=Ready node/kworker-vm
-          kubectl get nodes -o wide
 
-          kubectl get pods --all-namespaces -o wide
-          kubectl wait --for=condition=Ready --all pods --all-namespaces
+          until kubectl wait --for=condition=Ready --all pods --all-namespaces; do
+            kubectl get pods --all-namespaces -o wide
+          done
+
           kubectl get pods --all-namespaces -o wide
 
           EOF

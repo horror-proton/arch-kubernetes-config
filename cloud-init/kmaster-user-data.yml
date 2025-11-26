@@ -15,24 +15,16 @@ write_files:
   - path: /etc/systemd/journald.conf.d/fw-ttys0.conf
     permissions: '0644'
     content: |
-      #[Journal]
-      #ForwardToTTY=yes
-      #TTYPath=/dev/ttyS0,115200
-      #MaxLevelConsole=debug
-      #ForwardToWall=yes
-      #MaxLevelWall=debug
+      [Journal]
+      ForwardToConsole=yes
+      MaxLevelConsole=debug
 bootcmd:
   - [systemctl, mask, systemd-time-wait-sync.service]
-  - journalctl -f > /dev/ttyS0 &
+  # - journalctl -f > /dev/ttyS0 &
 runcmd:
   - echo > /etc/fstab
   - mount -a
   - swapoff -a
-  # - systemctl daemon-reload
-  # - systemctl restart systemd-journald
-  - |
-    cat >> /etc/pacman.conf << EOF
-    [archlinuxcn]
-    Server = https://repo.archlinuxcn.org/\$arch
-    EOF
-  - pacman -Sy --noconfirm && pacman -S --noconfirm archlinuxcn-keyring
+  - systemctl daemon-reload
+  - systemctl restart systemd-journald
+  - pacman -Sy --noconfirm
