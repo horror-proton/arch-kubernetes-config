@@ -1,12 +1,12 @@
+## template: jinja
 #cloud-config
-hostname: kworker-vm
 users:
   - name: arch
     sudo: ALL=(ALL) NOPASSWD:ALL
     groups: wheel
     shell: /bin/bash
     ssh_authorized_keys:
-      - SSH_PUBLIC_KEY
+      - {{ ds.meta_data.ssh_key }}
 #chpasswd:
 #  expire: false
 #  users:
@@ -18,10 +18,13 @@ write_files:
       [Journal]
       ForwardToConsole=yes
       MaxLevelConsole=debug
+  - path: /etc/modules-load.d/br_netfilter.conf # flannel
+    content: |
+      br_netfilter
 bootcmd:
   - [systemctl, mask, systemd-time-wait-sync.service]
-  # - journalctl -f > /dev/ttyS0 &
 runcmd:
+  - modprobe br_netfilter
   - echo > /etc/fstab
   - mount -a
   - swapoff -a

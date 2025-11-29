@@ -9,24 +9,71 @@ jobs:
       image: ghcr.io/archlinux/archlinux:base-devel
     outputs:
       token: ${{ steps.kubeadm-token.outputs.token }}
+      specs: ${{ steps.generate-specs.outputs.specs }}
     steps:
       - run: |
-          sudo pacman -Syu --noconfirm kubeadm
+          sudo pacman -Syu --noconfirm kubeadm yq
       - id: kubeadm-token
         run: |
           echo token=$(kubeadm token generate) >> $GITHUB_OUTPUT
+
+      - uses: actions/checkout@v4
+
+      - name: Generate mac and ip
+        id: generate-specs
+        run: |
+          i=86
+          j=10
+
+          echo '---' > specs.yml
+
+          for name in kmaster kworker; do
+            mac=$(printf '52:54:00:12:34:%02x\n' $i)
+            ip="192.168.100."$j
+            i=$((i+1))
+            j=$((j+1))
+            echo "$name mac: $mac ip: $ip"
+
+            echo "- name: $name" >> specs.yml
+            echo "  hostname: $name-vm" >> specs.yml
+            echo "  mac: $mac" >> specs.yml
+            echo "  ip: $ip" >> specs.yml
+
+            #if [[ $name == "kmaster" ]]; then
+            #  echo "  cni: cilium" >> specs.yml
+
+            #  echo "- name: $name" >> specs.yml
+            #  echo "  hostname: $name-vm" >> specs.yml
+            #  echo "  mac: $mac" >> specs.yml
+            #  echo "  ip: $ip" >> specs.yml
+            #  echo "  cni: flannel" >> specs.yml
+            #fi
+
+            cat > systemd-network/host/10-k8s-bridge.network.d/$name.conf << EOF
+          [DHCPServerStaticLease]
+          MACAddress=$mac
+          Address=$ip
+          EOF
+          done
+
+          cat specs.yml | yq > specs.json
+          cat specs.json >> $GITHUB_STEP_SUMMARY
+
+          echo specs=$(cat specs.json) >> $GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: systemd-network-host
+          path: systemd-network/host
 
   cloud-init:
     needs: [meta]
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        include:
-          - name: kmaster
-            mac: 52:54:00:12:34:56
-          - name: kworker
-            mac: 52:54:00:12:34:57
+        include: ${{ fromJson(needs.meta.outputs.specs) }}
       fail-fast: false
+    env: ${{ matrix }}
     steps:
       - name: Update and install dependencies
         run: |
@@ -36,6 +83,10 @@ jobs:
           # pacman -S --noconfirm git qemu-system-x86
 
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v6
+        with:
+          name: systemd-network-host
+          path: systemd-network-host
 
       - name: Config ssh and networking
         run: |
@@ -47,7 +98,7 @@ jobs:
               StrictHostKeyChecking accept-new
           EOF
 
-          sudo cp -vr systemd-network/host/* /etc/systemd/network/
+          sudo cp -vr systemd-network-host/* /etc/systemd/network/
           journalctl -f &
           sudo systemctl restart systemd-networkd
 
@@ -73,8 +124,11 @@ jobs:
       - name: Prepare cloud-init seed
         run: |
           key=$(sudo -u $USER -H sh -c 'cat ~/.ssh/id_rsa.pub')
-          sed -i 's|SSH_PUBLIC_KEY|'"$key"'|g' ./cloud-init/${{ matrix.name }}-user-data.yml
-          cloud-localds -v --disk-format qcow2 seed.qcow2 ./cloud-init/${{ matrix.name }}-user-data.yml
+
+          echo local-hostname: ${{ matrix.name }}-vm >> ./meta-data.yml
+          echo "ssh_key: $key" >> ./meta-data.yml
+
+          cloud-localds -v --disk-format qcow2 seed.qcow2 ./cloud-init/user-data.yml ./meta-data.yml
 
       - name: Arch Linux cloud image
         run: |
@@ -99,7 +153,7 @@ jobs:
             -display none \
             -serial stdio
 
-          journalctl --user -f -u $HOSTNAME &
+          journalctl --user -f --no-hostname --all -u $HOSTNAME &
 
           echo ::group::Waiting for VM to boot
           timeout -v 5m bash -c "until ip neigh show | tee /dev/stderr | grep $MAC\ REACHABLE; do sleep 2; done"
@@ -136,6 +190,7 @@ jobs:
           EOF
           echo ::endgroup::
 
+          ssh vm hostnamectl
           ssh vm 'sudo usermod --password $(echo arch | openssl passwd -1 -stdin) arch'
           sudo -u $USER -H sh -c 'cp ~/.ssh/id_rsa .'
 
@@ -161,17 +216,17 @@ jobs:
       - name: Config kubeadm init
         if: matrix.name == 'kmaster'
         run: |
-          ssh vm sudo pacman -S --noconfirm kubernetes-tools kubernetes-control-plane cilium-cli
+          ssh vm sudo pacman -S --noconfirm kubernetes-tools kubelet cilium-cli
           ssh vm sudo systemctl enable --now kubelet.service
           ssh vm sudo kubeadm -v=5 init \
             --cri-socket='unix:///run/crio/crio.sock' \
-            --pod-network-cidr=10.245.0.0/16 \
+            --pod-network-cidr=10.244.0.0/16 \
             --token=${{ needs.meta.outputs.token }}
 
       - name: Config kubeadm join
         if: matrix.name != 'kmaster'
         run: |
-          ssh vm sudo pacman -S --noconfirm kubernetes-tools kubernetes-node cilium-cli
+          ssh vm sudo pacman -S --noconfirm kubernetes-tools kubelet
           ssh vm sudo systemctl enable --now kubelet.service
 
           ssh vm sudo kubeadm config images pull
@@ -199,12 +254,6 @@ jobs:
           ssh vm sudo systemctl daemon-reload
           ssh vm sudo systemctl enable kubeadm-join.service
 
-      - name: Install Cilium CNI
-        if: matrix.name == 'kmaster'
-        run: |
-          ssh vm sudo env KUBECONFIG=/etc/kubernetes/admin.conf cilium-cli install
-          ssh vm sudo env KUBECONFIG=/etc/kubernetes/admin.conf cilium-cli status --wait
-
       - name: Set up kubeconfig
         if: matrix.name == 'kmaster'
         run: |
@@ -212,8 +261,22 @@ jobs:
           ssh kmaster-vm 'sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config'
           ssh kmaster-vm 'sudo chown $USER:$USER $HOME/.kube/config'
 
-          ssh kmaster-vm << EOF
-          journalctl -f -u kubelet &
+      - name: Install Cilium CNI
+        if: false # matrix.name == 'kmaster'
+        run: |
+          ssh vm sudo env KUBECONFIG=/etc/kubernetes/admin.conf cilium-cli install
+          ssh vm sudo env KUBECONFIG=/etc/kubernetes/admin.conf cilium-cli status --wait
+
+      - name: Install Flannel CNI
+        if: matrix.name == 'kmaster' # s&& matrix.cni == 'flannel'
+        run: |
+          timeout -v 5m ssh kmaster-vm bash -ex << EOF
+          # journalctl -f -u kubelet &
+          kubectl get events --watch --all-namespaces &
+
+          kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+
+          sh -c 'kubectl get pods -n kube-flannel --watch -o name | xargs -n1 -P0 kubectl -n kube-flannel logs' &
 
           kubectl get nodes -o wide
           kubectl wait --for=condition=Ready node/kmaster-vm
@@ -223,7 +286,8 @@ jobs:
           kubectl wait --for=condition=Ready --all pods --all-namespaces
           kubectl get pods --all-namespaces -o wide
 
-          killall journalctl || true
+          kill $(jobs -p) || true
+          killall kubectl || true
           EOF
 
       - name: Print configuration
@@ -280,17 +344,15 @@ jobs:
       - uses: actions/upload-artifact@v5
         if: always()
         with:
-          name: ${{ matrix.name }}-vm-image
+          name: ${{ matrix.name }}-vm-${{ matrix.cni && format('{0}-image', matrix.cni) || 'image' }}
           path: 'rootfs.qcow2'
-
-      - uses: actions/upload-artifact@v5
-        with:
-          name: ${{ matrix.name }}-vm-ssh-private-key
-          path: id_rsa
 
   run-cluster:
     needs: [meta, cloud-init]
     runs-on: ubuntu-latest
+    #strategy:
+    #  matrix:
+    #    cni: [cilium, flannel]
     steps:
       - name: Update and install dependencies
         run: |
