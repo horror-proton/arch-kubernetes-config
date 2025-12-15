@@ -18,6 +18,11 @@ write_files:
       [Journal]
       ForwardToConsole=yes
       MaxLevelConsole=debug
+  - path: /etc/systemd/network/10-cloud-init-eth0.network.d/mdns.conf
+    content: |
+      [Network]
+      MulticastDNS=yes
+      LLMNR=yes
   - path: /etc/modules-load.d/br_netfilter.conf # flannel
     content: |
       br_netfilter
@@ -29,5 +34,7 @@ runcmd:
   - mount -a
   - swapoff -a
   - systemctl daemon-reload
-  - systemctl restart systemd-journald
+  - systemctl reload-or-restart systemd-journald.service
+  - systemctl reload-or-restart systemd-networkd.service
+  - systemctl reload-or-restart systemd-resolved.service
   - pacman -Sy --noconfirm
