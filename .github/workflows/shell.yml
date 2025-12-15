@@ -198,6 +198,8 @@ jobs:
 
       - name: Resize root filesystem
         run: |
+          ssh vm sudo mount -t tmpfs tmpfs /var/cache/pacman/pkg
+
           ssh vm df -h
           ssh vm sudo pacman -Sy --noconfirm
           ssh vm sudo pacman -S --noconfirm parted
@@ -208,7 +210,7 @@ jobs:
       - name: Install CRI-O
         run: |
           yes | ssh vm sudo pacman -S iptables-nft
-          ssh vm sudo pacman -S --noconfirm cri-o
+          ssh vm sudo pacman -S --noconfirm cri-o --assume-installed libkrun
 
           ssh vm sudo systemctl enable --now crio
           ssh vm sudo crio status info
@@ -323,7 +325,7 @@ jobs:
 
           ssh vm sudo systemctl poweroff || true
 
-          journalctl --user -f -u $HOSTNAME &
+          journalctl --user -f --no-hostname --all -u $HOSTNAME &
           tail --pid=$(pidof qemu-system-x86_64) -f /dev/null
           kill $(jobs -p) || true
 
@@ -410,7 +412,7 @@ jobs:
             -display none \
             -serial stdio
 
-          journalctl --user -f -u $HOSTNAME &
+          journalctl --user -f --no-hostname --all -u $HOSTNAME &
 
           until ip neigh show | grep "$MAC REACHABLE"; do sleep 5; done
 
@@ -448,7 +450,7 @@ jobs:
             -display none \
             -serial stdio
 
-          journalctl --user -f -u $HOSTNAME &
+          journalctl --user -f --no-hostname --all -u $HOSTNAME &
 
           until ip neigh show | grep "$MAC REACHABLE"; do sleep 5; done
 
