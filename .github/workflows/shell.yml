@@ -297,7 +297,7 @@ jobs:
         run: |
           echo 'kubeadm config:' >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          ssh vm sudo kubeadm config print init-defaults | tee -a $GITHUB_STEP_SUMMARY
+          ssh vm kubectl -n kube-system get configmaps kubeadm-config --output yaml | tee -a $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Shutdown control plane
