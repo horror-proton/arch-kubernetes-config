@@ -98,6 +98,8 @@ jobs:
               StrictHostKeyChecking accept-new
           EOF
 
+          hostnamectl
+
           sudo cp -vr systemd-network-host/* /etc/systemd/network/
           journalctl -f &
           sudo networkctl reload

@@ -1,0 +1,28 @@
+on:
+  push:
+  pull_request:
+
+jobs:
+  machine-1:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          networkctl status --all
+          networkctl status --all | grep 'Search Domains:' | awk -F': ' '{print $2}' > search-domains.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: network-status-machine-1
+          path: search-domains.txt
+
+  machine-2:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          networkctl status --all
+          sleep 60
+      - uses: actions/download-artifact@v4
+        with:
+          name: network-status-machine-1
+      - run: |
+          dm1=$(cat search-domains.txt)
+          ping -c 4 "$dm1"
