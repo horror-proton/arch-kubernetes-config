@@ -100,7 +100,7 @@ jobs:
 
           sudo cp -vr systemd-network-host/* /etc/systemd/network/
           journalctl -f &
-          sudo systemctl restart systemd-networkd
+          sudo networkctl reload
 
           sleep 5
 
@@ -377,7 +377,7 @@ jobs:
 
           sudo cp -vr systemd-network/host/* /etc/systemd/network/
           journalctl -f &
-          sudo systemctl restart systemd-networkd
+          sudo networkctl reload
 
           sleep 5
 
